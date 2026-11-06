@@ -1,5 +1,9 @@
 """Unit tests for variable detection in agent history"""
 
+import pytest
+from pydantic import create_model
+
+from browser_use.agent.service import Agent
 from browser_use.agent.variable_detector import (
 	_detect_from_attributes,
 	_detect_from_value_pattern,
@@ -7,8 +11,11 @@ from browser_use.agent.variable_detector import (
 	_ensure_unique_name,
 	detect_variables_in_history,
 )
-from browser_use.agent.views import DetectedVariable
+from browser_use.agent.views import AgentHistory, AgentHistoryList, AgentOutput, DetectedVariable
+from browser_use.browser.views import BrowserStateHistory
 from browser_use.dom.views import DOMInteractedElement, NodeType
+from browser_use.tools.registry.views import ActionModel
+from browser_use.tools.views import InputTextAction
 
 
 def create_test_element(attributes: dict[str, str] | None = None) -> DOMInteractedElement:
@@ -245,20 +252,63 @@ def test_company_fields_preserve_more_specific_semantics():
 		assert _detect_from_attributes({'name': field_name}) == expected
 
 
-def test_detect_company_name_in_history():
-	"""Test company_name stays reusable as the company variable in history"""
-	history = create_mock_history(
-		[
-			(
-				{'input': {'index': 1, 'text': 'Acme Corp'}},
-				create_test_element(attributes={'name': 'company_name'}),
+@pytest.mark.parametrize('attribute', ['id', 'name', 'placeholder', 'aria-label'])
+@pytest.mark.parametrize('field_name', ['company', 'organization', 'company_name', 'organization_name'])
+def test_detect_company_from_semantic_attributes(attribute: str, field_name: str):
+	"""Company names are recognized through every supported semantic attribute."""
+	assert _detect_from_attributes({attribute: field_name}) == ('company', None)
+
+
+@pytest.mark.parametrize('prefix', ['', 'company_', 'organization_'])
+@pytest.mark.parametrize('field_name', ['first_name', 'last_name', 'full_name'])
+def test_personal_names_keep_precedence(prefix: str, field_name: str):
+	"""Specific personal-name fields still take precedence over company keywords."""
+	assert _detect_from_attributes({'name': prefix + field_name}) == (field_name, None)
+
+
+@pytest.mark.parametrize('field_name', ['name', 'date_name', 'city_name', 'state_name', 'country_name', 'postal_name'])
+def test_non_company_name_precedence_is_unchanged(field_name: str):
+	"""Do not change how unrelated name fields are classified."""
+	assert _detect_from_attributes({'name': field_name}) == ('name', None)
+
+
+@pytest.mark.parametrize('field_name', ['company_name', 'organization_name'])
+def test_company_name_detection_and_substitution(field_name: str, mock_llm):
+	"""A company detected in real history models can be substituted without mutating the original."""
+	action_model = create_model('InputActionModel', __base__=ActionModel, input=(InputTextAction | None, None))
+	output_model = AgentOutput.type_with_custom_actions(action_model)
+	history = AgentHistoryList(
+		history=[
+			AgentHistory(
+				model_output=output_model(
+					evaluation_previous_goal='ok',
+					memory='ok',
+					next_goal='done',
+					action=[action_model.model_validate({'input': InputTextAction(index=1, text='Acme Corp')})],
+				),
+				result=[],
+				state=BrowserStateHistory(
+					url='about:blank',
+					title='Company form',
+					tabs=[],
+					interacted_element=[create_test_element(attributes={'name': field_name})],
+				),
 			)
 		]
 	)
 
-	result = detect_variables_in_history(history)  # type: ignore[arg-type]
-
+	result = detect_variables_in_history(history)
+	assert list(result) == ['company']
 	assert result['company'].original_value == 'Acme Corp'
+
+	agent = Agent(task='test', llm=mock_llm)
+	modified = agent._substitute_variables_in_history(history, {'company': 'New Corp'})
+	modified_output = modified.history[0].model_output
+	original_output = history.history[0].model_output
+	assert modified_output is not None
+	assert original_output is not None
+	assert modified_output.action[0].model_dump()['input']['text'] == 'New Corp'
+	assert original_output.action[0].model_dump()['input']['text'] == 'Acme Corp'
 
 
 def test_detect_number_from_pattern():
